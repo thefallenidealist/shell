@@ -1,56 +1,49 @@
+// Created 190928
+// Simple shell which can be later used as UART shell on STM32
+// Point is to have a way to execute internal commands, like gpio_set(),
+// adc_read() and others to test its functionality without recompiling every
+// minute.
+
 #include <stdio.h>
 #include <stdint.h>
 #include "./src/3rd_party/strtok.c"	// copied from FreeBSD source
+#include <stdlib.h>		// 191111 exit()
+#include "./src/colors_ansi.h"
 
-#define SHELL_NAME	"ush"
+#ifdef DEBUG
+#define dprintf(fmt, ...) \
+	do { if (DEBUG) printf(ANSI_COLOR_YELLOW "DBG INFO %s:%d %s(): " \
+	ANSI_COLOR_RESET fmt, __FILE__, __LINE__, __func__,\
+	##__VA_ARGS__); } while (0)
+#else
+#define dprintf(...)
+#endif
 
+#define SHELL_NAME			"ush"
+#define SHELL_PROMPT_SIGN	"%%"
+#define DELIM				" "
+#define MAX_ARGV			10		// max args in one line (depends on DELIM)
+#define LINE_BUFFER_SIZE	255		// max chars in one line
+
+// helpers:
 static void print_argv(char **buffer);
-static char **split_line(char *line);
-static void shell_loop(void);
+static void remove_char(char *input, char to_remove);
 
-#define DELIM " "
-#define MAX_ARGV 10
-#define LINE_BUFFER_SIZE 100
-char *splitted[MAX_ARGV];	// commands after splliting on DELIM
-char input[LINE_BUFFER_SIZE];		// UART RX will populate this
+static void print_prompt(void);
+static char *read_line(void);
+static char **split_line(char *line);
+static uint8_t execute(char *argv[]);
+
 uint8_t cmd_help(char *argv[]);
 uint8_t cmd_echo(char *argv[]);
 uint8_t cmd_exit(char *argv[]);
 
+char *splitted[MAX_ARGV];	// commands after splliting on DELIM
+char input[LINE_BUFFER_SIZE];		// UART RX will populate this
+
+// types								 									{{{
+// ----------------------------------------------------------------------------
 typedef uint8_t (*cmd_fn)(char **);
-
-
-// print argv[] until null
-static void print_argv(char **buffer)
-{
-	printf("------------ %s()\n", __func__);
-	uint8_t n = 0;
-
-	while (buffer[n] != NULL)
-	{
-		printf("buffer[%d]: %s\n", n, buffer[n]);
-		n++;
-	}
-	// printf("------------ %s()\n", __func__);
-}
-
-// input: string
-// ouput: array of pointers to original string
-static char **split_line(char *line)
-{
-	char *token;
-	char *rest = line;
-	uint8_t n = 0;
-
-	// while ((token = strtok_r(rest, " ", &rest)))
-	while ((token = strtok_r(rest, DELIM, &rest)))
-	{
-		splitted[n++] = token;
-	}
-
-	return splitted;
-}
-
 typedef struct
 {
 	char		*name;
@@ -65,32 +58,28 @@ sh_cmd_t sh_cmd[] =
 };
 uint8_t NUMBER_OF_COMMANDS = sizeof(sh_cmd)/sizeof(sh_cmd[0]);
 
-
-
-
-uint8_t cmd_help(char *argv[])
+typedef enum
 {
-	// printf("%s() here, argv[0]: %s argv[1]: %s\n", __func__, argv[0], argv[1]);
-	printf(SHELL_NAME " help, available commands:\n");
-	for (uint8_t i = 0; i < NUMBER_OF_COMMANDS; i++)
+	ERET_SPLITLINE_ARGV_OVERRUN = -1,
+} return_codes;
+// ------------------------------------------------------------------------ }}}
+
+// helpers								 									{{{
+// ----------------------------------------------------------------------------
+// print argv[] until null
+static void print_argv(char **buffer)
+{
+#ifdef DEBUG
+	dprintf("------------\n");
+	uint8_t n = 0;
+
+	while (buffer[n] != NULL)
 	{
-		printf("  %s\n", sh_cmd[i].name);
+		printf("buffer[%d]: %s\n", n, buffer[n]);
+		n++;
 	}
-
-	return 1;
-}
-
-uint8_t cmd_echo(char *argv[])
-{
-	// printf("%s() here, argv[0]: %s argv[1]: %s\n", __func__, argv[0], argv[1]);
-	// printf("Echoing back 1st argument: %s\n", argv[1]);
-	printf("%s\n", argv[1]);
-	return 1;
-}
-
-uint8_t cmd_exit(char *argv[])
-{
-	return 0;
+	dprintf("------------\n");
+#endif
 }
 
 static void remove_char(char *input, char to_remove)
@@ -106,7 +95,51 @@ static void remove_char(char *input, char to_remove)
 	}
 	*dst = '\0';
 }
+// ------------------------------------------------------------------------ }}}
 
+// shell main functions - read_line, split_line, execute					{{{
+// ----------------------------------------------------------------------------
+static void print_prompt(void)
+{
+	printf(SHELL_NAME SHELL_PROMPT_SIGN " ");
+}
+
+// ----------------------------------------------------------------------------
+static char *read_line(void)
+{
+	// printf("input string: ");
+	fgets(input, 100, stdin);
+	// scanf("---> %s\n", input);
+	// printf("input string: %s", input);
+	remove_char(input, '\n');
+	return input;
+}
+
+// ----------------------------------------------------------------------------
+// input: string
+// ouput: array of pointers to original string
+static char **split_line(char *line)
+{
+	char *token;
+	char *rest = line;
+	uint8_t n = 0;
+
+	while ((token = strtok_r(rest, DELIM, &rest)))
+	{
+		splitted[n++] = token;
+		if (n == MAX_ARGV)
+		{
+			printf("Error, no more place for argv[%d], max is %d\n", n+1, MAX_ARGV);
+			exit(ERET_SPLITLINE_ARGV_OVERRUN);	// TODO 191110: make it to return only from this function, don't kill whole shell
+		}
+	}
+
+	print_argv(splitted);
+
+	return splitted;
+}
+
+// ----------------------------------------------------------------------------
 static uint8_t execute(char *argv[])
 {
 	if (argv[0] == NULL)
@@ -116,18 +149,12 @@ static uint8_t execute(char *argv[])
 		return 1;
 	}
 
-	// printf("1st char: %c %d\n", *argv[0], *argv[0]);
-
-	// if (*argv[0] == '\n')
 	if (*argv[0] == 0)
 	{
 		// ist just enter press, don't try to execute it
 		return 1;
 	}
 
-	// remove_char(argv[0], '\n');
-
-	// search for function
 	for (uint8_t i = 0; i < NUMBER_OF_COMMANDS; i++)
 	{
 		// execute if found
@@ -140,42 +167,52 @@ static uint8_t execute(char *argv[])
 	}
 
 	printf(SHELL_NAME ": Command not found: \"%s\"\n", argv[0]);
+	memset(input, 0, sizeof(input));
+	memset(splitted, 0, sizeof(splitted));
+
+	return 1;
+}
+// ------------------------------------------------------------------------ }}}
+
+// shell commands															{{{
+// ----------------------------------------------------------------------------
+uint8_t cmd_help(char *argv[])
+{
+	printf(SHELL_NAME " help, available commands:\n");
+	for (uint8_t i = 0; i < NUMBER_OF_COMMANDS; i++)
+	{
+		printf("  %s\n", sh_cmd[i].name);
+	}
 
 	return 1;
 }
 
-
-static char *read_line(void)
+uint8_t cmd_echo(char *argv[])
 {
-	// printf("input string: ");
-	fgets(input, 100, stdin);
-	// scanf("---> %s\n", input);
-	// printf("input string: %s", input);
-	remove_char(input, '\n');
-	return input;
+	printf("%s\n", argv[1]);
+	return 1;
 }
 
-
-static void shell_loop(void)
+uint8_t cmd_exit(char *argv[])
 {
-	char *line;
-	char **argv;	// will be something like: "cmd arg1 arg2 arg3 null"
-	uint8_t status;
-
-	do
-	{
-		printf("%% ");
-		line = read_line();
-		argv = split_line(line);
-		// print_argv(argv);
-		status = execute(argv);
-	} while (status);
+	return 0;
 }
+// ------------------------------------------------------------------------ }}}
 
 int main(int argc, const char *argv[])
 {
+	char *line;
+	char **argv_split;		// will be something like: "cmd arg1 arg2 arg3 null"
+	uint8_t status;
+
 	printf(SHELL_NAME " here, use help command\n");
-	shell_loop();
+	do
+	{
+		print_prompt();
+		line = read_line();
+		argv_split = split_line(line);
+		status = execute(argv_split);
+	} while (status);
 
 	return 0;
 }
